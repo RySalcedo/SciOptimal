@@ -1,97 +1,186 @@
-# app.py
 import streamlit as st
-import json
-from google.cloud import firestore
-from google.oauth2 import service_account
+from supabase import create_client
 from datetime import datetime
+import json
+import google.generativeai as genai
 
-from diagnosis_engine import LiftHistory, diagnose_lift
+# -----------------------------
+# CONFIG
+# -----------------------------
+st.set_page_config(
+    page_title="Plateau Breaker Engine",
+    page_icon="🏋️",
+    layout="centered"
+)
 
-st.set_page_config(page_title="Plateau Breaker Engine", page_icon="🏋️")
+# -----------------------------
+# SECRETS / CLIENTS
+# -----------------------------
+SUPABASE_URL = st.secrets["supabase_url"]
+SUPABASE_KEY = st.secrets["supabase_key"]
+GEMINI_API_KEY = st.secrets["gemini_api_key"]
 
-# ---------- Firestore client from Streamlit secrets ----------
-creds_dict = json.loads(st.secrets["firebase_service_account"])
-creds = service_account.Credentials.from_service_account_info(creds_dict)
-db = firestore.Client(credentials=creds, project=creds.project_id)
+supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+genai.configure(api_key=GEMINI_API_KEY)
+model = genai.GenerativeModel("gemini-1.5-pro")
 
-def get_user_doc(email: str):
-    return db.collection("users").document(email)
 
+# -----------------------------
+# DATA ACCESS (SUPABASE)
+# -----------------------------
 def save_lift_history(email: str, lift_name: str, result: dict):
-    doc = get_user_doc(email)
-    doc.collection("history").document(f"{lift_name}_{datetime.utcnow().isoformat()}").set(result)
-
-def load_user_history(email: str):
-    doc = get_user_doc(email)
-    return [d.to_dict() for d in doc.collection("history").order_by("weeks_without_progress", direction=firestore.Query.DESCENDING).stream()]
-
-
-# ---------- UI ----------
-st.title("Plateau Breaker Engine (Beta)")
-
-email = st.text_input("Enter your email to continue")
-if not email:
-    st.stop()
-
-st.caption(f"Logged in as **{email}**")
-
-st.header("Enter Your Training Data")
-
-lift_name = st.selectbox("Lift", ["Bench Press", "Squat", "Deadlift"])
-
-weekly_sets_str = st.text_input("Weekly sets (comma separated)", "8,8,9,9,8,7")
-weekly_1rm_str = st.text_input("Weekly est. 1RM (comma separated)", "120,121,121,120,120,119")
-
-avg_rpe = st.slider("Average RPE", 5.0, 10.0, 7.0)
-frequency = st.slider("Frequency per week", 1.0, 4.0, 1.5)
-variation_count = st.slider("Main lift changes (last 12 weeks)", 0, 6, 0)
-accessory_count = st.slider("Accessory exercises for this lift", 0, 6, 1)
-sticking_point = st.selectbox("Sticking point", ["none", "bottom", "mid", "lockout"])
-
-years_lifting = st.slider("Years lifting", 0.0, 10.0, 3.0)
-relative_strength = st.number_input("Relative strength (lift/bodyweight)", value=1.3)
-
-sleep = st.slider("Sleep hours", 4.0, 10.0, 6.5)
-stress = st.slider("Stress level (1–5)", 1, 5, 3)
-soreness = st.slider("Soreness level (1–5)", 1, 5, 3)
-drained = st.slider("Drained sessions ratio (0–1)", 0.0, 1.0, 0.3)
+    """Insert a new history row into Supabase."""
+    supabase.table("history").insert({
+        "email": email,
+        "lift_name": lift_name,
+        "result": result,
+        "created_at": datetime.utcnow().isoformat()
+    }).execute()
 
 
-if st.button("Analyze My Plateau"):
-    weekly_sets = [int(x.strip()) for x in weekly_sets_str.split(",") if x.strip()]
-    weekly_1rm = [float(x.strip()) for x in weekly_1rm_str.split(",") if x.strip()]
+def load_lift_history(email: str):
+    """Load all history rows for a given user."""
+    response = (
+        supabase.table("history")
+        .select("*")
+        .eq("email", email)
+        .order("created_at", desc=True)
+        .execute()
+    )
+    return response.data or []
 
-    lift = LiftHistory(
-        name=lift_name,
-        weekly_sets=weekly_sets,
-        weekly_est_1rm=weekly_1rm,
-        avg_rpe=avg_rpe,
-        frequency_per_week=frequency,
-        exercise_variation_count=variation_count,
-        accessory_count=accessory_count,
-        sticking_point_location=sticking_point,
-        years_lifting=years_lifting,
-        relative_strength=relative_strength,
-        sleep_hours=sleep,
-        stress_level=stress,
-        soreness_level=soreness,
-        drained_sessions_ratio=drained,
+
+# -----------------------------
+# AI LOGIC
+# -----------------------------
+SYSTEM_PROMPT = """
+You are a strength coach helping a lifter break plateaus.
+Given a lift, recent performance, and context, you will:
+
+1. Analyze why they might be stuck.
+2. Suggest specific changes (volume, intensity, frequency, exercise selection).
+3. Provide a 1–2 week microcycle focused on breaking the plateau.
+4. Keep language clear, direct, and practical.
+
+Return your answer as structured JSON with keys:
+- "summary": short text
+- "diagnosis": list of bullet points
+- "recommendations": list of bullet points
+- "microcycle": list of days, each with "day", "focus", "exercises"
+"""
+
+
+def analyze_lift(lift_name: str, weight: float, reps: int, rpe: float, notes: str):
+    user_prompt = f"""
+Lift: {lift_name}
+Top set: {weight} lbs x {reps} reps @ RPE {rpe}
+Notes: {notes}
+
+Using the instructions, respond ONLY with valid JSON.
+"""
+    response = model.generate_content(
+        [{"role": "system", "content": SYSTEM_PROMPT},
+         {"role": "user", "content": user_prompt}]
     )
 
-    result = diagnose_lift(lift)
+    # Try to parse JSON; if it fails, wrap raw text
+    try:
+        text = response.text.strip()
+        result = json.loads(text)
+    except Exception:
+        result = {
+            "summary": "AI response could not be parsed as JSON.",
+            "diagnosis": [response.text],
+            "recommendations": [],
+            "microcycle": []
+        }
+    return result
 
-    st.subheader("Primary Cause")
-    st.json(result["primary_cause"])
 
-    st.subheader("Secondary Causes")
-    st.json(result["secondary_causes"])
+# -----------------------------
+# UI HELPERS
+# -----------------------------
+def render_result(result: dict):
+    st.subheader("Summary")
+    st.write(result.get("summary", ""))
 
-    save_lift_history(email, lift_name, result)
-    st.success("Saved to your training history.")
+    diagnosis = result.get("diagnosis", [])
+    if diagnosis:
+        st.subheader("Diagnosis")
+        for item in diagnosis:
+            st.markdown(f"- {item}")
+
+    recs = result.get("recommendations", [])
+    if recs:
+        st.subheader("Recommendations")
+        for item in recs:
+            st.markdown(f"- {item}")
+
+    micro = result.get("microcycle", [])
+    if micro:
+        st.subheader("Suggested Microcycle")
+        for day in micro:
+            day_name = day.get("day", "Day")
+            focus = day.get("focus", "")
+            exercises = day.get("exercises", [])
+            st.markdown(f"**{day_name}** — {focus}")
+            for ex in exercises:
+                st.markdown(f"- {ex}")
+            st.markdown("---")
 
 
-st.header("Your Past Analyses")
-history = load_user_history(email)
-for entry in history:
-    with st.expander(f"{entry.get('lift', 'Lift')} – primary: {entry.get('primary_cause', {}).get('type', 'N/A')}"):
-        st.json(entry)
+def render_history(history_rows):
+    if not history_rows:
+        st.info("No history yet. Run an analysis to create your first entry.")
+        return
+
+    st.subheader("History")
+    for row in history_rows:
+        created = row.get("created_at", "")
+        lift_name = row.get("lift_name", "")
+        result = row.get("result", {})
+        with st.expander(f"{lift_name} — {created}"):
+            render_result(result)
+
+
+# -----------------------------
+# MAIN APP
+# -----------------------------
+def main():
+    st.title("🏋️ Plateau Breaker Engine")
+    st.caption("Supabase + Gemini + Streamlit")
+
+    # Simple "auth": just email field for now
+    email = st.text_input("Email (used to save your history)")
+    if not email:
+        st.warning("Enter your email to use history.")
+        st.stop()
+
+    st.markdown("---")
+    st.header("New Analysis")
+
+    col1, col2 = st.columns(2)
+    with col1:
+        lift_name = st.text_input("Lift name", value="Bench Press")
+        weight = st.number_input("Top set weight (lbs)", min_value=0.0, value=225.0, step=5.0)
+    with col2:
+        reps = st.number_input("Reps", min_value=1, value=5, step=1)
+        rpe = st.number_input("RPE", min_value=5.0, max_value=10.0, value=8.5, step=0.5)
+
+    notes = st.text_area("Context / notes (optional)", placeholder="Sleep, fatigue, recent changes, etc.")
+
+    if st.button("Analyze plateau", type="primary"):
+        with st.spinner("Analyzing with Gemini..."):
+            result = analyze_lift(lift_name, weight, reps, rpe, notes)
+            save_lift_history(email, lift_name, result)
+        st.success("Analysis complete and saved to history.")
+        render_result(result)
+
+    st.markdown("---")
+    st.header("Your History")
+    history_rows = load_lift_history(email)
+    render_history(history_rows)
+
+
+if __name__ == "__main__":
+    main()
